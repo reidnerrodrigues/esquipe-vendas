@@ -307,13 +307,64 @@ body.pick .wrap{padding-bottom:22px}
   var $=function(id){return document.getElementById(id);};
   var reduce=window.matchMedia&&window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  /* ----- armazenamento ----- */
+  /* ----- armazenamento: aparelho + nuvem ----- */
+  var API="/api/notas", CHAVE_APP="cmv8-2026-equipe";
   var mem={};
   function sget(k){ try{ var v=localStorage.getItem(k); return v===null?(k in mem?mem[k]:null):v; }catch(e){ return k in mem?mem[k]:null; } }
   function sset(k,v){ mem[k]=v; try{ localStorage.setItem(k,v); return true; }catch(e){ return false; } }
   function jget(k,d){ try{ var v=sget(k); return v?JSON.parse(v):d; }catch(e){ return d; } }
 
-  var current=null, notes={};
+  var current=null, notes={}, naNuvem=true;
+
+  function limpar(obj){
+    var saida={}; if(!obj||typeof obj!=="object") return saida;
+    Object.keys(obj).forEach(function(c){
+      var v=obj[c];
+      if(v&&typeof v==="object"&&typeof v.t==="string") saida[c]={t:v.t,ts:Number(v.ts)||0};
+      else if(typeof v==="string") saida[c]={t:v,ts:1};
+    });
+    return saida;
+  }
+  function mesclar(a,b){
+    var saida={},c;
+    for(c in a) saida[c]=a[c];
+    for(c in b){ if(!saida[c]||(b[c].ts||0)>(saida[c].ts||0)) saida[c]=b[c]; }
+    return saida;
+  }
+  function salvarLocal(){ if(current) sset(K_NOTES+current.id,JSON.stringify(notes)); }
+  function preencher(){
+    document.querySelectorAll(".notes textarea").forEach(function(t){
+      if(document.activeElement===t) return;
+      var v=notes[t.dataset.id]; t.value=v?v.t:"";
+    });
+  }
+  function enviar(keepalive){
+    if(!current) return Promise.resolve(false);
+    var eu=current.id;
+    return fetch(API,{
+      method:"POST",
+      headers:{"content-type":"application/json","x-app-key":CHAVE_APP},
+      body:JSON.stringify({user:eu,notas:notes}),
+      keepalive:!!keepalive
+    }).then(function(r){ return r.ok?r.json():Promise.reject(r.status); })
+      .then(function(d){
+        if(!current||current.id!==eu) return false;
+        notes=mesclar(notes,limpar(d.notas)); salvarLocal(); preencher(); naNuvem=true; return true;
+      }).catch(function(){ naNuvem=false; return false; });
+  }
+  function sincronizar(){
+    if(!current) return Promise.resolve(false);
+    var eu=current.id;
+    return fetch(API+"?user="+encodeURIComponent(eu),{headers:{"x-app-key":CHAVE_APP},cache:"no-store"})
+      .then(function(r){ return r.ok?r.json():Promise.reject(r.status); })
+      .then(function(d){
+        if(!current||current.id!==eu) return false;
+        var nuvem=limpar(d.notas), antes=JSON.stringify(nuvem);
+        notes=mesclar(nuvem,notes); salvarLocal(); preencher(); naNuvem=true;
+        if(JSON.stringify(notes)!==antes) return enviar();
+        return true;
+      }).catch(function(){ naNuvem=false; return false; });
+  }
 
   /* ----- perfis ----- */
   function renderProfiles(){
@@ -334,12 +385,13 @@ body.pick .wrap{padding-bottom:22px}
   }
   function login(p){
     current=p; sset(K_CUR,p.id);
-    notes=jget(K_NOTES+p.id,{}); if(!notes||typeof notes!=="object") notes={};
+    notes=limpar(jget(K_NOTES+p.id,{}));
     $("meName").textContent=p.nome;
     $("meImg").src=p.foto; $("meImg").alt="";
     $("meBtn").style.setProperty("--g",GRAD[p.time]);
-    document.querySelectorAll(".notes textarea").forEach(function(t){ t.value=notes[t.dataset.id]||""; });
+    preencher();
     document.querySelectorAll(".saved").forEach(function(s){ setSaved(s,"idle"); });
+    sincronizar();
     document.body.classList.remove("pick");
     $("who").hidden=true; $("app").hidden=false; $("tabs").hidden=false;
     if((location.hash||"").slice(1)!=="local"){
@@ -479,23 +531,31 @@ body.pick .wrap{padding-bottom:22px}
   /* ----- salvar observações ----- */
   var timer=0, pending=null;
   function setSaved(elm,state){
-    elm.className="saved"+(state==="ok"?" ok":state==="bad"?" bad":"");
-    elm.textContent = state==="saving"?"Salvando…":state==="ok"?"Salvo neste celular":state==="bad"?"Não foi possível salvar. Verifique o espaço do celular.":"";
+    elm.className="saved"+(state==="ok"?" ok":state==="local"?" bad":"");
+    elm.textContent = state==="saving" ? "Salvando…"
+      : state==="ok" ? "Salvo na nuvem"
+      : state==="local" ? "Salvo no aparelho. Vai para a nuvem quando a internet voltar."
+      : "";
   }
   function queue(id,val,elm){
     if(!current) return;
-    if(val) notes[id]=val; else delete notes[id];
+    notes[id]={t:val,ts:Date.now()};
+    salvarLocal();
     pending=elm; setSaved(elm,"saving");
-    clearTimeout(timer); timer=setTimeout(flush,400);
+    clearTimeout(timer); timer=setTimeout(function(){ flush(); },700);
   }
-  function flush(){
+  function flush(keepalive){
     clearTimeout(timer);
     if(!current||!pending) return;
-    var ok=sset(K_NOTES+current.id,JSON.stringify(notes));
-    setSaved(pending,ok?"ok":"bad"); pending=null;
+    var elm=pending; pending=null;
+    enviar(keepalive).then(function(ok){ setSaved(elm,ok?"ok":"local"); });
   }
-  window.addEventListener("pagehide",flush);
-  document.addEventListener("visibilitychange",function(){ if(document.hidden) flush(); });
+  window.addEventListener("pagehide",function(){ flush(true); });
+  window.addEventListener("online",function(){ sincronizar(); });
+  document.addEventListener("visibilitychange",function(){
+    if(document.hidden) flush(true); else sincronizar();
+  });
+  setInterval(function(){ if(!document.hidden&&!pending) sincronizar(); },60000);
 
   /* ----- copiar endereço ----- */
   $("copyBtn").addEventListener("click",function(){
